@@ -56,3 +56,51 @@ def get_ticket(
         )
 
     return ticket
+
+# Day 2: 工单列表查询
+from typing import Optional
+
+from fastapi import Query
+from sqlalchemy import select
+
+
+@app.get("/tickets", response_model=list[TicketResponse])
+def list_tickets(
+    status: Optional[str] = None,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+):
+    statement = select(Ticket)
+
+    if status is not None:
+        statement = statement.where(Ticket.status == status)
+
+    statement = (
+        statement
+        .order_by(Ticket.created_at.desc(), Ticket.id.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+
+    return db.scalars(statement).all()
+
+
+from app.api.schemas import TicketStatusUpdate
+from app.services.ticket_service import update_ticket_status
+
+
+@app.patch(
+    "/tickets/{ticket_id}/status",
+    response_model=TicketResponse,
+)
+def change_ticket_status(
+    ticket_id: str,
+    payload: TicketStatusUpdate,
+    db: Session = Depends(get_db),
+):
+    return update_ticket_status(
+        db=db,
+        ticket_id=ticket_id,
+        new_status=payload.status,
+    )

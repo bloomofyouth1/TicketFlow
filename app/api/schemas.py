@@ -16,3 +16,15 @@ class TicketResponse(BaseModel):
     content: str
     status: str
     created_at: datetime
+
+
+from typing import Literal
+
+
+class TicketStatusUpdate(BaseModel):
+    status: Literal[
+        "pending",
+        "processing",
+        "escalated",
+        "resolved",
+    ]

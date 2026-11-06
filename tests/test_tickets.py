@@ -88,3 +88,146 @@ def test_missing_ticket_returns_404(client):
     )
 
     assert response.status_code == 404
+
+
+def test_valid_status_transition(client):
+    response = client.post(
+        "/tickets",
+        json={
+            "user_id": "test_user",
+            "content": "测试状态更新",
+        },
+    )
+    assert response.status_code == 201
+    ticket_id = response.json()["id"]
+
+    response = client.patch(
+        f"/tickets/{ticket_id}/status",
+        json={"status": "processing"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "processing"
+
+
+def test_invalid_status_transition(client):
+    response = client.post(
+        "/tickets",
+        json={
+            "user_id": "test_user",
+            "content": "测试非法状态流转",
+        },
+    )
+    ticket_id = response.json()["id"]
+
+    client.patch(
+        f"/tickets/{ticket_id}/status",
+        json={"status": "processing"},
+    )
+
+    response = client.patch(
+        f"/tickets/{ticket_id}/status",
+        json={"status": "pending"},
+    )
+
+    assert response.status_code == 409
+
+
+def test_invalid_status_value(client):
+    response = client.post(
+        "/tickets",
+        json={
+            "user_id": "test_user",
+            "content": "测试非法状态名称",
+        },
+    )
+    ticket_id = response.json()["id"]
+
+    response = client.patch(
+        f"/tickets/{ticket_id}/status",
+        json={"status": "unknown"},
+    )
+
+    assert response.status_code == 422
+
+
+def test_resolved_is_terminal(client):
+    response = client.post(
+        "/tickets",
+        json={
+            "user_id": "test_user",
+            "content": "测试终态约束",
+        },
+    )
+    ticket_id = response.json()["id"]
+
+    for next_status in ["processing", "resolved"]:
+        response = client.patch(
+            f"/tickets/{ticket_id}/status",
+            json={"status": next_status},
+        )
+        assert response.status_code == 200
+
+    response = client.patch(
+        f"/tickets/{ticket_id}/status",
+        json={"status": "pending"},
+    )
+    assert response.status_code == 409
+
+
+def test_list_tickets_with_pagination(client):
+    for i in range(3):
+        response = client.post(
+            "/tickets",
+            json={
+                "user_id": "test_user",
+                "content": f"测试工单 {i}",
+            },
+        )
+        assert response.status_code == 201
+
+    response = client.get("/tickets?limit=2&offset=0")
+
+    assert response.status_code == 200
+    assert len(response.json()) == 2
+
+    response = client.get("/tickets?limit=2&offset=2")
+
+    assert response.status_code == 200
+    assert len(response.json()) == 1
+
+
+def test_filter_tickets_by_status(client):
+    response = client.post(
+        "/tickets",
+        json={
+            "user_id": "test_user",
+            "content": "待处理工单",
+        },
+    )
+    assert response.status_code == 201
+
+    response = client.post(
+        "/tickets",
+        json={
+            "user_id": "test_user",
+            "content": "处理中工单",
+        },
+    )
+    ticket_id = response.json()["id"]
+
+    client.patch(
+        f"/tickets/{ticket_id}/status",
+        json={"status": "processing"},
+    )
+
+    response = client.get("/tickets?status=processing")
+
+    assert response.status_code == 200
+    assert len(response.json()) == 1
+    assert response.json()[0]["id"] == ticket_id
+
+
+def test_invalid_pagination(client):
+    response = client.get("/tickets?limit=0")
+    assert response.status_code == 422
