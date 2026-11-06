@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from app.api.schemas import TicketCreate, TicketResponse
 from app.core.database import Base, engine, get_db
 from app.models.ticket import Ticket
+from app.models.ticket_event import TicketEvent
 
 # 第一版先自动建表，后续使用数据库迁移管理
 Base.metadata.create_all(bind=engine)
@@ -104,3 +105,32 @@ def change_ticket_status(
         ticket_id=ticket_id,
         new_status=payload.status,
     )
+
+
+from app.api.schemas import TicketEventResponse
+
+
+@app.get(
+    "/tickets/{ticket_id}/events",
+    response_model=list[TicketEventResponse],
+)
+def get_ticket_events(
+    ticket_id: str,
+    db: Session = Depends(get_db),
+):
+    ticket = db.get(Ticket, ticket_id)
+
+    if ticket is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Ticket not found",
+        )
+
+    events = (
+        db.query(TicketEvent)
+        .filter(TicketEvent.ticket_id == ticket_id)
+        .order_by(TicketEvent.id.asc())
+        .all()
+    )
+
+    return events

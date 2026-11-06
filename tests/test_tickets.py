@@ -231,3 +231,154 @@ def test_filter_tickets_by_status(client):
 def test_invalid_pagination(client):
     response = client.get("/tickets?limit=0")
     assert response.status_code == 422
+
+
+def test_ticket_event_created(client):
+    response = client.post(
+        "/tickets",
+        json={
+            "user_id": "event_test",
+            "content": "测试操作历史",
+        },
+    )
+    ticket_id = response.json()["id"]
+
+    response = client.patch(
+        f"/tickets/{ticket_id}/status",
+        json={"status": "processing"},
+    )
+    assert response.status_code == 200
+
+    response = client.get(f"/tickets/{ticket_id}/events")
+    assert response.status_code == 200
+
+    events = response.json()
+
+    assert len(events) == 1
+    assert events[0]["from_status"] == "pending"
+    assert events[0]["to_status"] == "processing"
+    assert events[0]["actor"] == "system"
+
+
+def test_invalid_transition_does_not_create_event(client):
+    response = client.post(
+        "/tickets",
+        json={
+            "user_id": "event_test",
+            "content": "测试非法操作不写历史",
+        },
+    )
+    ticket_id = response.json()["id"]
+
+    response = client.patch(
+        f"/tickets/{ticket_id}/status",
+        json={"status": "resolved"},
+    )
+    assert response.status_code == 409
+
+    response = client.get(f"/tickets/{ticket_id}/events")
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_ticket_events_are_isolated(client):
+    ids = []
+
+    for i in range(2):
+        response = client.post(
+            "/tickets",
+            json={
+                "user_id": "event_test",
+                "content": f"工单 {i}",
+            },
+        )
+        ids.append(response.json()["id"])
+
+    response = client.patch(
+        f"/tickets/{ids[0]}/status",
+        json={"status": "processing"},
+    )
+    assert response.status_code == 200
+
+    first_events = client.get(
+        f"/tickets/{ids[0]}/events"
+    ).json()
+
+    second_events = client.get(
+        f"/tickets/{ids[1]}/events"
+    ).json()
+
+    assert len(first_events) == 1
+    assert second_events == []
+
+
+def test_transaction_rollback_when_event_insert_fails(
+    client,
+    monkeypatch,
+):
+    from sqlalchemy.exc import SQLAlchemyError
+    from app.models.ticket_event import TicketEvent
+    from app.services import ticket_service
+
+    # 先创建一条工单
+    response = client.post(
+        "/tickets",
+        json={
+            "user_id": "rollback_test",
+            "content": "测试事务回滚",
+        },
+    )
+
+    assert response.status_code == 201
+    ticket_id = response.json()["id"]
+
+    # 模拟事件写入时数据库发生异常
+    def failing_commit(self):
+        raise SQLAlchemyError("Simulated database failure")
+
+    # 保存原始方法
+    from sqlalchemy.orm import Session
+    original_commit = Session.commit
+
+    # 仅在事件存在时模拟失败
+    def conditional_commit(self):
+        has_event = any(
+            isinstance(obj, TicketEvent)
+            for obj in self.new
+        )
+        if has_event:
+            return failing_commit(self)
+
+        return original_commit(self)
+
+    monkeypatch.setattr(
+        Session,
+        "commit",
+        conditional_commit,
+    )
+
+    # API 调用会引发模拟异常
+    with pytest.raises(SQLAlchemyError):
+        client.patch(
+            f"/tickets/{ticket_id}/status",
+            json={"status": "processing"},
+        )
+
+    # 恢复 commit 方法，允许后续正常查询
+    monkeypatch.setattr(
+        Session,
+        "commit",
+        original_commit,
+    )
+
+    # 验证状态没有被错误更新
+    response = client.get(f"/tickets/{ticket_id}")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "pending"
+
+    # 验证没有留下不完整的操作历史
+    response = client.get(f"/tickets/{ticket_id}/events")
+
+    assert response.status_code == 200
+    assert response.json() == []

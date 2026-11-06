@@ -28,3 +28,14 @@ class TicketStatusUpdate(BaseModel):
         "escalated",
         "resolved",
     ]
+
+
+class TicketEventResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    ticket_id: str
+    from_status: str
+    to_status: str
+    actor: str
+    created_at: datetime
