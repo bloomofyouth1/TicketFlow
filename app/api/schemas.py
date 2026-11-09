@@ -39,3 +39,16 @@ class TicketEventResponse(BaseModel):
     to_status: str
     actor: str
     created_at: datetime
+
+
+class TicketProcessingResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    ticket_id: str
+    category: str
+    action: str
+    faq_id: str | None
+    suggested_reply: str | None
+    reason: str
+    method: str
+    created_at: datetime

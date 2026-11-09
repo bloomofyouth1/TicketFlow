@@ -7,6 +7,8 @@ from app.models.ticket import Ticket
 from app.models.ticket_event import TicketEvent
 
 # 第一版先自动建表，后续使用数据库迁移管理
+from app.models.ticket_processing import TicketProcessingResult
+
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
@@ -134,3 +136,37 @@ def get_ticket_events(
     )
 
     return events
+
+
+from app.api.schemas import TicketProcessingResponse
+from app.services.processing_service import process_ticket
+
+
+@app.post(
+    "/tickets/{ticket_id}/process",
+    response_model=TicketProcessingResponse,
+)
+def process_ticket_endpoint(
+    ticket_id: str,
+    db: Session = Depends(get_db),
+):
+    return process_ticket(db, ticket_id)
+
+
+@app.get(
+    "/tickets/{ticket_id}/processing-result",
+    response_model=TicketProcessingResponse,
+)
+def get_processing_result(
+    ticket_id: str,
+    db: Session = Depends(get_db),
+):
+    result = db.get(TicketProcessingResult, ticket_id)
+
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Processing result not found",
+        )
+
+    return result
