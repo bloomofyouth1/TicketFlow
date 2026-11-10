@@ -1,3 +1,4 @@
+from app.core.logging_config import setup_logging
 from fastapi import Depends, FastAPI, HTTPException, status
 from sqlalchemy.orm import Session
 
@@ -10,6 +11,8 @@ from app.models.ticket_event import TicketEvent
 from app.models.ticket_processing import TicketProcessingResult
 
 Base.metadata.create_all(bind=engine)
+
+setup_logging()
 
 app = FastAPI(
     title="TicketFlow API",
