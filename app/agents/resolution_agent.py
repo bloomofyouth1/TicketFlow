@@ -6,7 +6,7 @@ from typing import TypedDict
 
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph, START, END
-from openai import OpenAI
+from openai import OpenAI, APITimeoutError
 
 from app.agents.ticket_graph import run_ticket_graph
 from app.services.faq_retriever import retrieve_faq
@@ -68,17 +68,32 @@ def request_model(messages):
         base_url=os.getenv(
             "DEEPSEEK_BASE_URL", "https://api.deepseek.com"
         ),
-        timeout=20,
+        timeout=25.0,
         max_retries=0,
     )
-    return client.chat.completions.create(
-        model=os.getenv("DEEPSEEK_MODEL", "deepseek-flash"),
-        messages=messages,
-        tools=TOOLS,
-        tool_choice="auto",
-        max_tokens=350,
-        extra_body={"thinking": {"type": "disabled"}},
-    )
+
+    for attempt in range(2):
+        try:
+            return client.chat.completions.create(
+                model=os.getenv(
+                    "DEEPSEEK_MODEL", "deepseek-flash"
+                ),
+                messages=messages,
+                tools=TOOLS,
+                tool_choice="auto",
+                max_tokens=350,
+                extra_body={
+                    "thinking": {"type": "disabled"}
+                },
+            )
+        except APITimeoutError:
+            logger.warning(
+                "Agent API timeout, attempt=%d/2",
+                attempt + 1,
+            )
+            if attempt == 1:
+                raise
+            time.sleep(1)
 
 
 def model_node(state: AgentState):
