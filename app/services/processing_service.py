@@ -1,10 +1,13 @@
+from app.agents.resolution_agent import run_resolution_agent
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.models.ticket import Ticket
 from app.models.ticket_event import TicketEvent
 from app.models.ticket_processing import TicketProcessingResult
+import os
 from app.agents.ticket_graph import run_ticket_graph
+from app.agents.hybrid_ticket_graph import run_hybrid_ticket_graph
 
 
 def process_ticket(db: Session, ticket_id: str):
@@ -27,7 +30,18 @@ def process_ticket(db: Session, ticket_id: str):
             detail="Only pending tickets can be processed",
         )
 
-    decision = run_ticket_graph(ticket.content)
+    mode = os.getenv("TICKETFLOW_ANALYZER", "rule")
+
+    if mode == "agent":
+        decision = run_resolution_agent(ticket.content)
+    elif mode == "llm":
+        decision = run_hybrid_ticket_graph(ticket.content)
+    elif mode == "rule":
+        decision = run_ticket_graph(ticket.content)
+    else:
+        raise RuntimeError(
+            f"Unsupported analyzer mode: {mode}"
+        )
 
     if decision.action == "suggest_reply":
         new_status = "processing"
