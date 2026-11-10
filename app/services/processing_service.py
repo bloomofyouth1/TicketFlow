@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from app.models.ticket import Ticket
 from app.models.ticket_event import TicketEvent
 from app.models.ticket_processing import TicketProcessingResult
-from app.services.ticket_processor import process_ticket_content
+from app.agents.ticket_graph import run_ticket_graph
 
 
 def process_ticket(db: Session, ticket_id: str):
@@ -27,7 +27,7 @@ def process_ticket(db: Session, ticket_id: str):
             detail="Only pending tickets can be processed",
         )
 
-    decision = process_ticket_content(ticket.content)
+    decision = run_ticket_graph(ticket.content)
 
     if decision.action == "suggest_reply":
         new_status = "processing"
