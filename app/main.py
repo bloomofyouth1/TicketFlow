@@ -1,3 +1,4 @@
+from app.models.agent_execution import AgentExecution
 from app.core.logging_config import setup_logging
 from fastapi import Depends, FastAPI, HTTPException, status
 from sqlalchemy.orm import Session

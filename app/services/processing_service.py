@@ -1,3 +1,5 @@
+import json
+from app.models.agent_execution import AgentExecution
 from app.agents.resolution_agent import run_resolution_agent
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
@@ -32,8 +34,39 @@ def process_ticket(db: Session, ticket_id: str):
 
     mode = os.getenv("TICKETFLOW_ANALYZER", "rule")
 
+    agent_outcome = None
+
     if mode == "agent":
-        decision = run_resolution_agent(ticket.content)
+        events = (
+            db.query(TicketEvent)
+            .filter(TicketEvent.ticket_id == ticket.id)
+            .order_by(TicketEvent.id.asc())
+            .all()
+        )
+
+        ticket_context = {
+            "id": ticket.id,
+            "status": ticket.status,
+            "content": ticket.content,
+        }
+
+        history = [
+            {
+                "from_status": e.from_status,
+                "to_status": e.to_status,
+                "actor": e.actor,
+            }
+            for e in events
+        ]
+
+        agent_outcome = run_resolution_agent(
+            ticket.content,
+            ticket_context=ticket_context,
+            history=history,
+            return_outcome=True,
+        )
+
+        decision = agent_outcome.result
     elif mode == "llm":
         decision = run_hybrid_ticket_graph(ticket.content)
     elif mode == "rule":
@@ -74,6 +107,27 @@ def process_ticket(db: Session, ticket_id: str):
         ticket.status = new_status
         db.add(result)
         db.add(event)
+
+        if agent_outcome is not None:
+            db.add(AgentExecution(
+                ticket_id=ticket.id,
+                model_calls=agent_outcome.model_calls,
+                tool_calls=agent_outcome.tool_calls,
+                input_tokens=agent_outcome.input_tokens,
+                output_tokens=agent_outcome.output_tokens,
+                latency_seconds=agent_outcome.latency_seconds,
+                tool_names=json.dumps(
+                    agent_outcome.tool_names,
+                    ensure_ascii=False,
+                ),
+                trace=json.dumps(
+                    agent_outcome.trace,
+                    ensure_ascii=False,
+                ),
+                error_type=agent_outcome.error_type,
+                fallback=bool(agent_outcome.error_type),
+            ))
+
         db.commit()
         db.refresh(result)
 
