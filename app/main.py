@@ -16,6 +16,8 @@ from app.models.ticket_processing import TicketProcessingResult
 
 from app.models.ticket_review import TicketReview
 
+from app.models.agent_task import AgentTask
+
 Base.metadata.create_all(bind=engine)
 
 setup_logging()
@@ -189,3 +191,7 @@ def get_processing_result(
 
 from app.api.review_routes import router as review_router
 app.include_router(review_router)
+
+
+from app.api.agent_task_routes import router as agent_task_router
+app.include_router(agent_task_router)
