@@ -212,3 +212,7 @@ app.include_router(agent_task_router)
 
 
 
+
+
+from app.api.agent_execution_routes import router as agent_execution_router
+app.include_router(agent_execution_router)

@@ -10,314 +10,430 @@ API = os.getenv(
 ).rstrip("/")
 
 st.set_page_config(
-    page_title="TicketFlow",
+    page_title="TicketFlow Console",
     page_icon="🎫",
     layout="wide",
 )
 
 
-def api(method, path, **kwargs):
+def request(method, path, *, quiet_404=False, **kwargs):
     try:
         with httpx.Client(timeout=15) as client:
             response = client.request(
                 method, API + path, **kwargs
             )
-            response.raise_for_status()
-            return response.json()
+
+        if quiet_404 and response.status_code == 404:
+            return None
+
+        response.raise_for_status()
+        return response.json()
+
     except httpx.HTTPStatusError as exc:
+        detail = exc.response.text
         try:
             detail = exc.response.json().get(
-                "detail", exc.response.text
+                "detail", detail
             )
         except ValueError:
-            detail = exc.response.text
-        st.error(
-            f"API 错误 {exc.response.status_code}: {detail}"
-        )
+            pass
+        st.error(f"API {exc.response.status_code}: {detail}")
+
     except httpx.RequestError as exc:
         st.error(
-            f"无法连接后端 API：{type(exc).__name__}"
+            "连接后端失败：" + type(exc).__name__
         )
+
     return None
 
 
-def set_selected(ticket_id):
-    st.session_state.selected_ticket = ticket_id
+def select_ticket(ticket_id):
+    st.session_state.ticket_id = ticket_id
+    st.session_state.task_id = None
+
+
+def current_ticket():
+    ticket_id = st.session_state.get("ticket_id")
+    if not ticket_id:
+        return None
+    return request(
+        "GET", f"/tickets/{ticket_id}",
+        quiet_404=True,
+    )
+
+
+def current_processing():
+    ticket_id = st.session_state.get("ticket_id")
+    if not ticket_id:
+        return None
+    return request(
+        "GET",
+        f"/tickets/{ticket_id}/processing-result",
+        quiet_404=True,
+    )
 
 
 st.title("🎫 TicketFlow")
 st.caption(
-    "企业智能工单处置平台 · "
-    "DeepSeek + LangGraph + FastAPI"
+    "企业智能工单系统 | "
+    "LangGraph · DeepSeek · FastAPI"
 )
 
-health = api("GET", "/health")
-if health is None:
-    st.warning(
-        "FastAPI 尚不可用。请先启动后端服务。"
-    )
+if request("GET", "/health") is None:
     st.stop()
 
-tab1, tab2, tab3 = st.tabs([
+tickets = request(
+    "GET",
+    "/tickets",
+    params={"limit": 100, "offset": 0},
+) or []
+
+with st.sidebar:
+    st.header("工单导航")
+
+    if st.button("刷新数据", use_container_width=True):
+        st.rerun()
+
+    if tickets:
+        ids = [t["id"] for t in tickets]
+        current_id = st.session_state.get("ticket_id")
+
+        options = [""] + ids
+        initial = (
+            options.index(current_id)
+            if current_id in options else 0
+        )
+
+        chosen = st.selectbox(
+            "选择工单",
+            options,
+            index=initial,
+            format_func=lambda x: (
+                "请选择" if not x else
+                next(
+                    (
+                        f"{t['status']} | "
+                        f"{t['content'][:24]} | {x[:8]}"
+                        for t in tickets if t["id"] == x
+                    ),
+                    x,
+                )
+            ),
+        )
+
+        if chosen and chosen != current_id:
+            select_ticket(chosen)
+            st.rerun()
+    else:
+        st.info("暂无工单")
+
+    st.divider()
+    st.caption("当前模式由 FastAPI 服务端配置决定")
+    st.caption("此版本仅用于受控开发和演示环境")
+
+
+tab_create, tab_agent, tab_review = st.tabs([
     "📋 工单管理",
     "🤖 Agent 工作台",
     "👤 人工审核",
 ])
 
-with tab1:
-    st.subheader("创建工单")
 
-    with st.form("create_ticket", clear_on_submit=True):
+with tab_create:
+    st.subheader("创建新工单")
+
+    with st.form("new_ticket", clear_on_submit=True):
         user_id = st.text_input(
-            "客户编号", value="demo_customer"
+            "客户编号",
+            value="demo_customer",
         )
         content = st.text_area(
-            "工单内容",
+            "问题描述",
             placeholder="例如：忘记密码，怎么重置密码？",
         )
+
         submitted = st.form_submit_button(
-            "提交工单", type="primary"
+            "创建工单",
+            type="primary",
         )
 
-        if submitted:
-            if not user_id.strip() or not content.strip():
-                st.error("客户编号和工单内容不能为空")
-            else:
-                data = api(
-                    "POST", "/tickets",
-                    json={
-                        "user_id": user_id.strip(),
-                        "content": content.strip(),
-                    },
-                )
-                if data:
-                    set_selected(data["id"])
-                    st.success(
-                        f"工单创建成功：{data['id']}"
-                    )
+    if submitted:
+        if not user_id.strip() or not content.strip():
+            st.warning("请填写客户编号和问题描述")
+        else:
+            result = request(
+                "POST",
+                "/tickets",
+                json={
+                    "user_id": user_id.strip(),
+                    "content": content.strip(),
+                },
+            )
+            if result:
+                select_ticket(result["id"])
+                st.rerun()
 
     st.divider()
     st.subheader("工单列表")
 
-    left, right = st.columns([2, 1])
-
-    with left:
-        status = st.selectbox(
-            "状态筛选",
-            ["all", "pending", "processing",
-             "escalated", "resolved"],
-        )
-    with right:
-        if st.button("刷新列表"):
-            st.rerun()
-
-    params = {"limit": 100, "offset": 0}
-    if status != "all":
-        params["status"] = status
-
-    tickets = api(
-        "GET", "/tickets", params=params
+    status_filter = st.selectbox(
+        "筛选状态",
+        ["all", "pending", "processing",
+         "escalated", "resolved"],
     )
 
-    if tickets is not None:
-        st.dataframe(
-            tickets,
-            use_container_width=True,
-            hide_index=True,
-        )
+    filtered = [
+        t for t in tickets
+        if status_filter == "all"
+        or t["status"] == status_filter
+    ]
 
-        if tickets:
-            ids = [item["id"] for item in tickets]
-            choice = st.selectbox(
-                "选择工单",
-                ids,
-                format_func=lambda ticket_id: (
-                    next(
-                        (
-                            t["content"][:55]
-                            for t in tickets
-                            if t["id"] == ticket_id
-                        ),
-                        ticket_id,
-                    )
-                    + " | " + ticket_id[:8]
-                ),
+    st.dataframe(
+        filtered,
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.caption("当前显示最近查询到的最多 100 条工单")
+
+
+ticket = current_ticket()
+processing = current_processing() if ticket else None
+
+
+with tab_agent:
+    st.subheader("Agent 执行控制台")
+
+    if not ticket:
+        st.info("请先创建或选择工单")
+    else:
+        st.write("**工单 ID：**", ticket["id"])
+        st.write("**问题：**", ticket["content"])
+
+        status = ticket["status"]
+        st.write("**当前状态：**", status)
+
+        if status == "pending":
+            if st.button(
+                "启动异步 Agent",
+                type="primary",
+            ):
+                task = request(
+                    "POST",
+                    f"/tickets/{ticket['id']}/process-async",
+                )
+                if task:
+                    st.session_state.task_id = task["id"]
+                    st.rerun()
+
+        task_id = st.session_state.get("task_id")
+
+        if task_id:
+            task = request(
+                "GET", f"/agent-tasks/{task_id}",
+                quiet_404=True,
             )
-            if st.button("查看该工单"):
-                set_selected(choice)
-                st.success("已切换当前工单")
+            if task:
+                st.subheader("任务状态")
+                st.write(task["status"])
 
+                if task["status"] in {"queued", "running"}:
+                    st.info("Agent 正在运行，请刷新页面")
+                    if st.button("刷新 Agent 状态"):
+                        st.rerun()
 
-selected = st.session_state.get("selected_ticket")
-
-with tab2:
-    st.subheader("Agent 工作台")
-
-    ticket_id = st.text_input(
-        "当前工单 ID",
-        value=selected or "",
-        key="agent_ticket_id",
-    ).strip()
-
-    if ticket_id:
-        ticket = api(
-            "GET", f"/tickets/{ticket_id}"
-        )
-        if ticket:
-            st.write("**工单状态：**", ticket["status"])
-            st.write("**客户问题：**", ticket["content"])
-
-            if ticket["status"] == "pending":
-                if st.button(
-                    "启动异步 Agent",
-                    type="primary",
-                ):
-                    task = api(
-                        "POST",
-                        f"/tickets/{ticket_id}/process-async",
-                    )
-                    if task:
-                        st.session_state.current_task = task["id"]
-                        st.success(
-                            f"任务已提交：{task['id']}"
-                        )
-
-            result = api(
-                "GET",
-                f"/tickets/{ticket_id}/processing-result",
-            )
-            if result:
-                st.subheader("处置结果")
-                st.json(result)
-
-    task_id = st.text_input(
-        "任务 ID",
-        value=st.session_state.get(
-            "current_task", ""
-        ),
-        key="task_id_input",
-    ).strip()
-
-    if task_id:
-        if st.button("刷新任务状态"):
-            st.rerun()
-
-        task = api(
-            "GET", f"/agent-tasks/{task_id}"
-        )
-        if task:
-            st.write("**任务状态：**", task["status"])
-            st.json(task)
-
-with tab3:
-    st.subheader("人工审核")
-
-    review_ticket_id = st.text_input(
-        "待审核工单 ID",
-        value=selected or "",
-        key="review_ticket_id",
-    ).strip()
-
-    if review_ticket_id:
-        ticket = api(
-            "GET", f"/tickets/{review_ticket_id}"
-        )
-
-        if ticket:
-            st.write("**当前状态：**", ticket["status"])
-            st.write("**工单内容：**", ticket["content"])
-
-            processing = api(
-                "GET",
-                f"/tickets/{review_ticket_id}/processing-result",
-            )
-            if processing:
-                st.write("**Agent 处理动作：**",
-                         processing["action"])
-                if processing.get("suggested_reply"):
-                    st.text_area(
-                        "候选回复",
-                        processing["suggested_reply"],
-                        disabled=True,
+                if task["status"] == "failed":
+                    st.error(
+                        "任务执行失败：" +
+                        str(task.get("error_type"))
                     )
 
-            reviewer = st.text_input(
-                "审核人员编号",
-                value="staff_001",
+        if processing:
+            st.divider()
+            st.subheader("Agent 决策")
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric(
+                "分类",
+                processing["category"],
             )
-            note = st.text_area(
-                "审核意见",
-                value="已核对工单处置结果",
+            c2.metric(
+                "处理动作",
+                processing["action"],
+            )
+            c3.metric(
+                "处理方法",
+                processing["method"],
             )
 
-            if ticket["status"] == "processing":
-                decisions = {
-                    "批准并结单": "approve",
-                    "驳回并转人工": "reject",
-                }
-            elif ticket["status"] == "escalated":
-                decisions = {
-                    "人工处理完成并结单": "resolve",
-                }
-            else:
-                decisions = {}
+            st.write(
+                "**决策依据：**",
+                processing["reason"],
+            )
 
-            if decisions:
-                selected_action = st.selectbox(
+            if processing.get("faq_id"):
+                st.write(
+                    "**FAQ 来源：**",
+                    processing["faq_id"],
+                )
+
+            if processing.get("suggested_reply"):
+                st.text_area(
+                    "待审核候选回复",
+                    processing["suggested_reply"],
+                    disabled=True,
+                    height=120,
+                )
+
+        metrics = request(
+            "GET",
+            f"/tickets/{ticket['id']}/agent-execution",
+            quiet_404=True,
+        )
+
+        if metrics:
+            st.divider()
+            st.subheader("Agent 运行指标")
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric(
+                "总 Token",
+                metrics["total_tokens"],
+            )
+            m2.metric(
+                "模型调用",
+                metrics["model_calls"],
+            )
+            m3.metric(
+                "工具调用",
+                metrics["tool_calls"],
+            )
+            m4.metric(
+                "执行耗时",
+                f"{metrics['latency_seconds']:.2f}s",
+            )
+
+            st.write(
+                "**调用工具：**",
+                " → ".join(metrics["tool_names"])
+                or "无",
+            )
+            st.write(
+                "**节点执行路径：**",
+                " → ".join(metrics["trace"]),
+            )
+
+            if metrics["error_type"]:
+                st.warning(
+                    "Agent 异常：" + metrics["error_type"]
+                )
+
+            with st.expander("查看完整执行指标"):
+                st.json(metrics)
+
+        elif processing:
+            st.caption(
+                "当前处理方式没有独立的 Agent 指标记录"
+            )
+
+
+with tab_review:
+    st.subheader("人工审核工作台")
+
+    if not ticket:
+        st.info("请先选择工单")
+    else:
+        st.write("**工单 ID：**", ticket["id"])
+        st.write("**当前状态：**", ticket["status"])
+        st.write("**工单问题：**", ticket["content"])
+
+        if processing:
+            st.write(
+                "**Agent 建议：**",
+                processing["action"],
+            )
+            if processing.get("suggested_reply"):
+                st.text_area(
+                    "待审核回复",
+                    processing["suggested_reply"],
+                    disabled=True,
+                    height=120,
+                )
+
+        status = ticket["status"]
+
+        if status == "processing":
+            decisions = {
+                "批准候选回复并结单": "approve",
+                "驳回并转人工": "reject",
+            }
+        elif status == "escalated":
+            decisions = {
+                "人工处理完成并结单": "resolve",
+            }
+        else:
+            decisions = {}
+
+        if decisions:
+            with st.form(
+                f"review_{ticket['id']}_{status}"
+            ):
+                reviewer = st.text_input(
+                    "审核人",
+                    value="staff_001",
+                )
+                note = st.text_area(
+                    "审核意见",
+                    value="已核对处理结果",
+                )
+                label = st.selectbox(
                     "审核决定",
                     list(decisions.keys()),
                 )
-
-                if st.button(
-                    "提交审核决定",
+                submit_review = st.form_submit_button(
+                    "确认审核",
                     type="primary",
-                ):
-                    if not reviewer.strip() or not note.strip():
-                        st.error("审核人员和意见不能为空")
-                    else:
-                        decision = decisions[selected_action]
-                        result = api(
-                            "POST",
-                            (
-                                f"/tickets/{review_ticket_id}"
-                                f"/reviews/{decision}"
-                            ),
-                            json={
-                                "reviewer_id": reviewer.strip(),
-                                "note": note.strip(),
-                            },
-                        )
-                        if result:
-                            st.success("审核操作成功")
-                            st.rerun()
-            else:
-                st.info(
-                    "当前状态不支持人工审核操作"
                 )
 
-            st.divider()
-            st.subheader("审核记录")
+            if submit_review:
+                if not reviewer.strip() or not note.strip():
+                    st.warning("请填写审核人和审核意见")
+                else:
+                    decision = decisions[label]
+                    result = request(
+                        "POST",
+                        f"/tickets/{ticket['id']}/reviews/{decision}",
+                        json={
+                            "reviewer_id": reviewer.strip(),
+                            "note": note.strip(),
+                        },
+                    )
+                    if result:
+                        st.rerun()
+        else:
+            st.info("当前状态无需人工审核")
 
-            reviews = api(
-                "GET",
-                f"/tickets/{review_ticket_id}/reviews",
+        st.divider()
+        st.subheader("审核记录")
+
+        reviews = request(
+            "GET",
+            f"/tickets/{ticket['id']}/reviews",
+        )
+        if reviews is not None:
+            st.dataframe(
+                reviews,
+                hide_index=True,
+                use_container_width=True,
             )
-            if reviews is not None:
-                st.dataframe(
-                    reviews,
-                    use_container_width=True,
-                    hide_index=True,
-                )
 
-            st.subheader("状态变更历史")
-
-            events = api(
-                "GET",
-                f"/tickets/{review_ticket_id}/events",
+        st.subheader("工单状态历史")
+        events = request(
+            "GET",
+            f"/tickets/{ticket['id']}/events",
+        )
+        if events is not None:
+            st.dataframe(
+                events,
+                hide_index=True,
+                use_container_width=True,
             )
-            if events is not None:
-                st.dataframe(
-                    events,
-                    use_container_width=True,
-                    hide_index=True,
-                )
