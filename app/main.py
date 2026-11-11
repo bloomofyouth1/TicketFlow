@@ -11,6 +11,8 @@ from app.models.ticket_event import TicketEvent
 # 第一版先自动建表，后续使用数据库迁移管理
 from app.models.ticket_processing import TicketProcessingResult
 
+from app.models.ticket_review import TicketReview
+
 Base.metadata.create_all(bind=engine)
 
 setup_logging()
@@ -174,3 +176,7 @@ def get_processing_result(
         )
 
     return result
+
+
+from app.api.review_routes import router as review_router
+app.include_router(review_router)
