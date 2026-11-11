@@ -18,11 +18,25 @@ from app.models.ticket_review import TicketReview
 
 from app.models.agent_task import AgentTask
 
+from app.models.processing_claim import ProcessingClaim
+
 Base.metadata.create_all(bind=engine)
 
 setup_logging()
 
-app = FastAPI(
+
+from contextlib import asynccontextmanager
+from app.services.task_recovery import recover_interrupted_tasks
+
+
+@asynccontextmanager
+async def ticketflow_lifespan(app):
+    # 仅在服务启动时执行一次任务恢复
+    recover_interrupted_tasks()
+    yield
+
+
+app = FastAPI(lifespan=ticketflow_lifespan, 
     title="TicketFlow API",
     description="Enterprise AI Ticket Processing System",
     version="0.1.0",
@@ -195,3 +209,6 @@ app.include_router(review_router)
 
 from app.api.agent_task_routes import router as agent_task_router
 app.include_router(agent_task_router)
+
+
+

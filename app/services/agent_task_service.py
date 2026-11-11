@@ -1,16 +1,20 @@
 import logging
 import threading
 import uuid
+
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
 from sqlalchemy import select
-from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.orm import Session
 
 from app.models.agent_task import AgentTask
 from app.models.ticket import Ticket
+from app.services.processing_claim_service import (
+    acquire_claim,
+    release_claim,
+)
 from app.services.processing_service import process_ticket
 
 
@@ -31,57 +35,91 @@ def utc_now():
     return datetime.now(timezone.utc)
 
 
-def _mark_failed(session, task_id, error_type):
-    task = session.get(AgentTask, task_id)
-    if task is None:
-        return
+def find_task(db, ticket_id):
+    return db.scalar(
+        select(AgentTask)
+        .where(AgentTask.ticket_id == ticket_id)
+    )
 
-    task.status = "failed"
-    task.error_type = error_type[:128]
-    task.finished_at = utc_now()
-    session.commit()
+
+def mark_failed(db, task_id, error_type):
+    task = db.get(AgentTask, task_id)
+
+    if task is not None:
+        task.status = "failed"
+        task.error_type = error_type[:128]
+        task.finished_at = utc_now()
+        db.commit()
 
 
 def _run_job(task_id, bind):
-    # 每个任务创建自己的数据库会话
-    try:
-        with Session(bind=bind, expire_on_commit=False) as db:
-            try:
-                job = db.get(AgentTask, task_id)
+    ticket_id = None
 
-                if job is None or job.status != "queued":
+    try:
+        with Session(
+            bind=bind,
+            expire_on_commit=False,
+        ) as db:
+            try:
+                task = db.get(AgentTask, task_id)
+
+                if task is None:
                     return
 
-                job.status = "running"
-                job.started_at = utc_now()
+                ticket_id = task.ticket_id
+
+                if task.status != "queued":
+                    return
+
+                task.status = "running"
+                task.started_at = utc_now()
                 db.commit()
 
-                # 复用已有的 Agent + 工单处理服务
-                process_ticket(db, job.ticket_id)
+                process_ticket(
+                    db,
+                    ticket_id,
+                    claim_owner=task_id,
+                )
 
-                job = db.get(AgentTask, task_id)
-                job.status = "succeeded"
-                job.finished_at = utc_now()
+                task = db.get(AgentTask, task_id)
+                task.status = "succeeded"
+                task.finished_at = utc_now()
                 db.commit()
 
             except Exception as exc:
                 db.rollback()
-                error_type = type(exc).__name__
-
-                logger.exception(
-                    "Agent task failed: task_id=%s",
-                    task_id,
+                logger.error(
+                    "Agent task failed: %s",
+                    type(exc).__name__,
                 )
 
                 try:
-                    _mark_failed(db, task_id, error_type)
+                    mark_failed(
+                        db, task_id, type(exc).__name__
+                    )
                 except Exception:
                     db.rollback()
                     logger.exception(
-                        "Could not persist task failure"
+                        "Could not persist failed task"
                     )
 
     finally:
+        # 无论成功或失败，都释放此任务的认领。
+        # 使用独立 Session，避免复用已失败的事务。
+        if ticket_id is not None:
+            try:
+                with Session(bind=bind) as cleanup:
+                    release_claim(
+                        cleanup,
+                        ticket_id,
+                        task_id,
+                    )
+                    cleanup.commit()
+            except Exception:
+                logger.exception(
+                    "Could not release processing claim"
+                )
+
         capacity.release()
 
 
@@ -91,11 +129,8 @@ def submit_agent_task(db: Session, ticket_id: str):
     if ticket is None:
         raise HTTPException(404, "Ticket not found")
 
-    existing = db.scalar(
-        select(AgentTask).where(
-            AgentTask.ticket_id == ticket_id
-        )
-    )
+    existing = find_task(db, ticket_id)
+
     if existing is not None:
         return existing, False
 
@@ -106,13 +141,11 @@ def submit_agent_task(db: Session, ticket_id: str):
 
     if not capacity.acquire(blocking=False):
         db.expire_all()
-        existing = db.scalar(
-            select(AgentTask).where(
-                AgentTask.ticket_id == ticket_id
-            )
-        )
+        existing = find_task(db, ticket_id)
+
         if existing is not None:
             return existing, False
+
         raise HTTPException(
             503, "Agent task capacity reached"
         )
@@ -122,33 +155,27 @@ def submit_agent_task(db: Session, ticket_id: str):
     try:
         task_id = str(uuid.uuid4())
 
-        stmt = (
-            insert(AgentTask)
-            .values(
-                id=task_id,
-                ticket_id=ticket_id,
-                status="queued",
-                created_at=utc_now(),
-            )
-            .on_conflict_do_nothing(
-                index_elements=["ticket_id"]
-            )
-        )
-        inserted = db.execute(stmt)
-        db.commit()
+        # 先认领再创建任务，两次写入在同一事务内提交
+        if not acquire_claim(db, ticket_id, task_id):
+            db.rollback()
+            existing = find_task(db, ticket_id)
 
-        if inserted.rowcount != 1:
-            db.expire_all()
-            existing = db.scalar(
-                select(AgentTask).where(
-                    AgentTask.ticket_id == ticket_id
-                )
+            if existing is not None:
+                return existing, False
+
+            raise HTTPException(
+                409, "Ticket processing already in progress"
             )
-            if existing is None:
-                raise RuntimeError(
-                    "Conflicting task not found"
-                )
-            return existing, False
+
+        task = AgentTask(
+            id=task_id,
+            ticket_id=ticket_id,
+            status="queued",
+            created_at=utc_now(),
+        )
+
+        db.add(task)
+        db.commit()
 
         try:
             executor.submit(
@@ -156,12 +183,21 @@ def submit_agent_task(db: Session, ticket_id: str):
                 task_id,
                 db.get_bind(),
             )
-            # 容量归后台执行器管理
             owned_capacity = False
+
         except Exception as exc:
-            _mark_failed(
-                db, task_id, type(exc).__name__
-            )
+            db.rollback()
+            try:
+                mark_failed(
+                    db, task_id, type(exc).__name__
+                )
+                release_claim(
+                    db, ticket_id, task_id
+                )
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
 
         return db.get(AgentTask, task_id), True
 

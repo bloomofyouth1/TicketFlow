@@ -75,7 +75,7 @@ def test_async_task_success_and_deduplication(client):
 def test_async_task_failure_is_recorded(
     client, monkeypatch
 ):
-    def failing_processor(db, ticket_id):
+    def failing_processor(db, ticket_id, **kwargs):
         raise RuntimeError("Simulated failure")
 
     monkeypatch.setattr(
@@ -105,7 +105,7 @@ def test_task_capacity_limit(client, monkeypatch):
     release = threading.Event()
     started = threading.Event()
 
-    def blocking_processor(db, ticket_id):
+    def blocking_processor(db, ticket_id, **kwargs):
         started.set()
         if not release.wait(timeout=4):
             raise TimeoutError("Test worker timeout")
