@@ -36,3 +36,14 @@ def client(tmp_path):
     finally:
         app.dependency_overrides.clear()
         engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+def enable_legacy_status_for_existing_tests(monkeypatch):
+    """
+    兼容早期状态机测试。
+    正式服务默认关闭旧状态写接口。
+    """
+    monkeypatch.setenv(
+        "TICKETFLOW_LEGACY_STATUS_WRITES", "1"
+    )

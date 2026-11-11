@@ -1,3 +1,6 @@
+import os as _legacy_status_os
+from fastapi import HTTPException as _LegacyStatusHTTPException
+
 from app.models.agent_execution import AgentExecution
 from app.core.logging_config import setup_logging
 from fastapi import Depends, FastAPI, HTTPException, status
@@ -108,6 +111,12 @@ def change_ticket_status(
     payload: TicketStatusUpdate,
     db: Session = Depends(get_db),
 ):
+    if _legacy_status_os.getenv('TICKETFLOW_LEGACY_STATUS_WRITES', '0') != '1':
+        raise _LegacyStatusHTTPException(
+            status_code=403,
+            detail='Use the human review API for state changes',
+        )
+
     return update_ticket_status(
         db=db,
         ticket_id=ticket_id,
