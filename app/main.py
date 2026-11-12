@@ -216,3 +216,13 @@ app.include_router(agent_task_router)
 
 from app.api.agent_execution_routes import router as agent_execution_router
 app.include_router(agent_execution_router)
+
+
+# TicketFlow 演示环境统一访问控制
+from app.core.demo_auth import demo_auth_middleware
+
+@app.get("/auth/check", tags=["Authentication"])
+def check_demo_access():
+    return {"authenticated": True}
+
+app.middleware("http")(demo_auth_middleware)

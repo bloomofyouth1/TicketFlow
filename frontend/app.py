@@ -18,9 +18,17 @@ st.set_page_config(
 
 def request(method, path, *, quiet_404=False, **kwargs):
     try:
+        headers = dict(kwargs.pop("headers", {}))
+
+        token = st.session_state.get("auth_token")
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
         with httpx.Client(timeout=15) as client:
             response = client.request(
-                method, API + path, **kwargs
+                method, API + path,
+                headers=headers,
+                **kwargs
             )
 
         if quiet_404 and response.status_code == 404:
@@ -81,6 +89,52 @@ st.caption(
 
 if request("GET", "/health") is None:
     st.stop()
+
+
+# 演示环境登录入口。
+# 正式鉴权由 FastAPI 执行。
+if os.getenv("TICKETFLOW_REQUIRE_AUTH", "0") == "1":
+    if not st.session_state.get("auth_token"):
+        st.subheader("管理员登录")
+        st.caption("请输入 TicketFlow 演示访问密钥")
+
+        with st.form("demo_login"):
+            entered_token = st.text_input(
+                "访问密钥",
+                type="password",
+            )
+            login = st.form_submit_button(
+                "登录",
+                type="primary",
+            )
+
+        if login:
+            entered_token = entered_token.strip()
+
+            if not entered_token:
+                st.error("请输入访问密钥")
+            else:
+                st.session_state.auth_token = entered_token
+
+                check = request(
+                    "GET", "/auth/check"
+                )
+
+                if check and check.get("authenticated"):
+                    st.rerun()
+                else:
+                    st.session_state.pop(
+                        "auth_token", None
+                    )
+
+        st.stop()
+
+    with st.sidebar:
+        if st.button("退出登录"):
+            st.session_state.pop(
+                "auth_token", None
+            )
+            st.rerun()
 
 tickets = request(
     "GET",
