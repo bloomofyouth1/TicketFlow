@@ -2,15 +2,19 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TypedDict
 
 from dotenv import load_dotenv
 from langgraph.graph import START, END, StateGraph
 from openai import OpenAI, APITimeoutError
 
+from app.agents.review_policy import (
+    has_credential_recovery_intent,
+    required_human_review,
+)
 from app.agents.ticket_graph import run_ticket_graph
-from app.services.faq_retriever import retrieve_faq
+from app.services.faq_retriever import load_faq, retrieve_faq
 from app.services.ticket_processor import ProcessingResult
 
 load_dotenv()
@@ -51,18 +55,20 @@ TOOLS = [
     ),
     tool_definition(
         "get_ticket",
-        "读取当前工单的编号、状态和用户问题；无需参数",
+        "核查本工单的编号或状态时使用；常规 FAQ 问题无需调用；无需参数",
     ),
     tool_definition(
         "get_history",
-        "读取当前工单已有的状态变更历史；无需参数",
+        "用户明确问处理进度或此前处理记录时使用；常规 FAQ 问题无需调用；无需参数",
     ),
 ]
 
 SYSTEM_PROMPT = (
     "你是TicketFlow的专用工单处置Agent。"
-    "根据问题选择必要的只读工具，不必调用全部工具。"
+    "根据问题选择必要的只读工具。普通密码重置等操作指引只需先调用一次 search_faq，取得证据后直接总结。仅在工单明确需要状态或历史时调用相应工具。遇到工具额度不足的返回，请总结已有证据，证据不足则建议转人工。"
     "查询具体操作步骤时，应先使用search_faq。"
+    "检索词使用知识库常用表达。若用户在询问如何找回或重设自己的登录凭据，"
+    "可改写为忘记密码、重置密码等标准搜索词，并保留原问题的关键限制。"
     "需要了解当前工单状态时使用get_ticket，"
     "需要了解已有处理过程时使用get_history。"
     "不得编造FAQ引用、擅自修改工单或执行退款。"
@@ -83,6 +89,7 @@ class AgentOutcome:
     error_type: str | None
     tool_names: list[str]
     trace: list[str]
+    retrieved_faq_ids: list[str] = field(default_factory=list)
 
 
 class AgentState(TypedDict, total=False):
@@ -103,7 +110,7 @@ class AgentState(TypedDict, total=False):
     trace: list[str]
 
 
-def request_model(messages):
+def request_model(messages, *, allow_tools=True):
     client = OpenAI(
         api_key=os.environ["DEEPSEEK_API_KEY"],
         base_url=os.getenv(
@@ -120,8 +127,7 @@ def request_model(messages):
                     "DEEPSEEK_MODEL", "deepseek-flash"
                 ),
                 messages=messages,
-                tools=TOOLS,
-                tool_choice="auto",
+                **({"tools": TOOLS, "tool_choice": "auto"} if allow_tools else {}),
                 max_tokens=350,
                 extra_body={
                     "thinking": {"type": "disabled"}
@@ -139,7 +145,14 @@ def request_model(messages):
 
 def model_node(state: AgentState):
     try:
-        response = request_model(state["messages"])
+        allow_tools = (
+            state["tool_calls"] < MAX_TOOL_CALLS
+            and state["model_calls"] + 1 < MAX_MODEL_CALLS
+        )
+        if allow_tools:
+            response = request_model(state["messages"])
+        else:
+            response = request_model(state["messages"], allow_tools=False)
         choice = response.choices[0]
         msg = choice.message
         calls = msg.tool_calls or []
@@ -174,10 +187,10 @@ def model_node(state: AgentState):
                 "pending_calls": [],
             }
 
-        if calls and state["tool_calls"] + len(calls) > MAX_TOOL_CALLS:
+        if calls and not allow_tools:
             return {
                 **updates,
-                "error": "ToolBudgetExceeded",
+                "error": "UnexpectedToolCalls",
                 "pending_calls": [],
             }
 
@@ -202,7 +215,7 @@ def model_node(state: AgentState):
             **updates,
             "messages": messages,
             "pending_calls": calls,
-            "final_answer": msg.content or "",
+            "final_answer": "" if calls else msg.content or "",
         }
     except Exception as exc:
         return {
@@ -240,6 +253,8 @@ def execute_tool(name, arguments, state):
         # 使用模型选择的检索关键词；
         # 最终仍由原始工单和规则基线进行安全校验。
         items = retrieve_faq(query, top_k=2)
+        if not items and query.strip() != state["content"].strip():
+            items = retrieve_faq(state["content"], top_k=2)
         return [
             {"id": x.id, "title": x.title, "answer": x.answer}
             for x in items
@@ -266,9 +281,26 @@ def tools_node(state: AgentState):
     tool_names = list(state["tool_names"])
     executed = 0
 
+    # V1.7: budget-aware tool execution
+    remaining = max(0, MAX_TOOL_CALLS - state["tool_calls"])
+    trace = state["trace"] + ["tools"]
+    calls = sorted(
+        state["pending_calls"],
+        key=lambda call: call.function.name != "search_faq",
+    )
+
     try:
-        for call in state["pending_calls"]:
+        for call in calls:
             name = call.function.name
+            if executed >= remaining:
+                trace.append(f"tool_skipped_budget:{name}")
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": json.dumps({"error": "ToolBudgetExceeded"}),
+                })
+                continue
+
             result = execute_tool(
                 name,
                 call.function.arguments,
@@ -297,7 +329,7 @@ def tools_node(state: AgentState):
             "tool_names": tool_names,
             "tool_calls": state["tool_calls"] + executed,
             "pending_calls": [],
-            "trace": state["trace"] + ["tools"],
+            "trace": trace,
         }
 
     except Exception as exc:
@@ -306,7 +338,7 @@ def tools_node(state: AgentState):
             "tool_names": tool_names,
             "tool_calls": state["tool_calls"] + executed,
             "pending_calls": [],
-            "trace": state["trace"] + ["tool_error"],
+            "trace": trace + ["tool_error"],
         }
 
 
@@ -322,21 +354,47 @@ def finalize_node(state: AgentState):
     baseline = run_ticket_graph(state["content"])
     error = state.get("error")
 
-    allowed = (
+    review_reason = required_human_review(
+        state["content"], state.get("history", [])
+    )
+    if review_reason:
+        return {
+            "result": ProcessingResult(
+                category=baseline.category,
+                action="escalate",
+                faq_id=None,
+                suggested_reply=None,
+                reason=review_reason,
+                method="agent_guarded",
+            ),
+            "trace": state["trace"] + ["finalize"],
+        }
+
+    has_evidence = (
         not error
         and bool(state.get("final_answer"))
-        and baseline.category == "account"
-        and baseline.action == "suggest_reply"
-        and baseline.faq_id == "FAQ-001"
         and "FAQ-001" in state["evidence_ids"]
     )
+    reply = None
 
-    if allowed:
+    if has_evidence:
+        if baseline.category == "account" and baseline.action == "suggest_reply":
+            reply = baseline.suggested_reply
+        elif (
+            baseline.category in {"account", "other"}
+            and has_credential_recovery_intent(state["content"])
+        ):
+            reply = next(
+                (item["answer"] for item in load_faq() if item["id"] == "FAQ-001"),
+                None,
+            )
+
+    if reply:
         result = ProcessingResult(
-            category=baseline.category,
+            category="account",
             action="suggest_reply",
             faq_id="FAQ-001",
-            suggested_reply=baseline.suggested_reply,
+            suggested_reply=reply,
             reason="Agent retrieved approved FAQ evidence",
             method="agent_guarded",
         )
@@ -424,6 +482,7 @@ def run_resolution_agent(
         error_type=state.get("error"),
         tool_names=state["tool_names"],
         trace=state["trace"],
+        retrieved_faq_ids=list(dict.fromkeys(state["evidence_ids"])),
     )
 
     logger.info(json.dumps({
@@ -436,6 +495,7 @@ def run_resolution_agent(
         "output_tokens": outcome.output_tokens,
         "latency_seconds": outcome.latency_seconds,
         "tool_names": outcome.tool_names,
+        "retrieved_faq_ids": outcome.retrieved_faq_ids,
         "error_type": outcome.error_type,
         "trace": outcome.trace,
     }, ensure_ascii=False))
